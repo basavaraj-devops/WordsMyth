@@ -1,0 +1,220 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordsmyth-w2-prod-deployment
+  namespace: prod
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: wordsmyth-w2-prod
+  template:
+    metadata:
+      labels:
+        app: wordsmyth-w2-prod
+    spec:
+      containers:
+      - name: wordsmyth-w2-prod
+        image: OMITTED
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: nginx-config
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+        resources:
+          limits:
+            cpu: "250m"
+            memory: "512Mi"
+          requests:
+            cpu: "125m"
+            memory: "256Mi"
+        # Add liveness probe
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          timeoutSeconds: 5       # Match ALB timeout
+          periodSeconds: 15       # Match ALB interval
+          failureThreshold: 2     # Match ALB unhealthy threshold
+          successThreshold: 1     # Minimum value for liveness
+        # Add readiness probe
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          timeoutSeconds: 5       # Match ALB timeout
+          periodSeconds: 15       # Match ALB interval
+          failureThreshold: 2     # Match ALB unhealthy threshold
+          successThreshold: 2     # Match ALB healthy threshold
+      volumes:
+      - name: nginx-config
+        configMap:
+          name: wordsmyth-w2-prod-nginx-config
+      imagePullSecrets:
+      - name: prod-ecr-registry-secret
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 25%  # Made Changed Here
+      maxSurge: 25%      # Made Changed Here
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: wordsmyth-w2-prod-service
+  namespace: prod
+spec:
+  type: ClusterIP  # Service Type
+  ports:
+    - port: 80
+      targetPort: 80  # Your frontend container port
+      protocol: TCP
+  selector:
+    app: wordsmyth-w2-prod # Match this with your frontend pod labels
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wordsmyth-w2-prod-nginx-config
+  namespace: prod
+data:
+  nginx.conf: |
+    user nginx;
+    worker_processes auto;
+    error_log /var/log/nginx/error.log warn;
+    pid /var/run/nginx.pid;
+
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        include /etc/nginx/mime.types;
+        default_type application/octet-stream;
+
+        # Logging configuration
+        log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                        '$status $body_bytes_sent "$http_referer" '
+                        '"$http_user_agent" "$http_x_forwarded_for"';
+
+        access_log /var/log/nginx/access.log main;
+
+        # Basic settings
+        sendfile on;
+        tcp_nopush on;
+        tcp_nodelay on;
+        keepalive_timeout 65;
+        types_hash_max_size 2048;
+
+        # Gzip compression
+        gzip on;
+        gzip_disable "msie6";
+        gzip_vary on;
+        gzip_proxied any;
+        gzip_comp_level 6;
+        gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+
+        server {
+            listen 80;
+            server_name _;
+            root /usr/share/nginx/html;
+            index index.html;
+
+            # Security headers
+            add_header X-Frame-Options "SAMEORIGIN";
+            add_header X-XSS-Protection "1; mode=block";
+            add_header X-Content-Type-Options "nosniff";
+
+            # Main location block for the React app
+            location / {
+                try_files $uri $uri/ /index.html;
+                expires -1;
+            }
+
+            # Static assets caching
+            location /assets {
+                expires 1y;
+                add_header Cache-Control "public, no-transform";
+            }
+
+            # Health check endpoint 
+            location /health { 
+                default_type text/plain; 
+                 return 200 'OK'; 
+            }
+
+            # API proxy configuration
+            location /api {
+                # Remove internal proxy_pass since ALB will handle routing 
+                # proxy_pass http://user-mng-w2-prod:5000/;  # <- Commented this line
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection 'upgrade';
+                proxy_set_header Host $host;
+                proxy_cache_bypass $http_upgrade;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+
+                # CORS headers
+                add_header 'Access-Control-Allow-Origin' '*' always;
+                add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, PUT, DELETE' always;
+                add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization' always;
+            }
+
+            # Error handling
+            error_page 404 /index.html;
+            error_page 500 502 503 504 /50x.html;
+            location = /50x.html {
+                root /usr/share/nginx/html;
+            }
+        }
+    }
+
+
+# Horizontal Pod Auto Scaler for Frontend:
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: wordsmyth-w2-prod-prod-hpa
+  namespace: prod
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: wordsmyth-w2-prod-prod-deployment
+  minReplicas: 2   # Made Changes in frontend-deploy.yaml file in the Bastion-Master node located under /repos directory.
+  maxReplicas: 5
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 80
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Pods
+        value: 2
+        periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 60
